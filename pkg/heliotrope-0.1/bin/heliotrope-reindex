@@ -1,0 +1,151 @@
+#!/usr/bin/env ruby
+# encoding: UTF-8
+
+$:.unshift File.join(File.expand_path(File.dirname(__FILE__)), "..", "lib")
+
+require 'rubygems'
+require 'trollop'
+require "heliotrope"
+require 'fileutils'
+require 'json'
+require 'xdg'
+
+opts = Trollop::options do
+  banner <<EOS
+Rebuilds the Whistlepig index for the current store. Does not change any data,
+but will skip messages marked as deleted or spam by default.
+
+Useful if you've added documents out of order and wish to reorder them, or if
+the index has become corrupted.
+
+Usage: #{$0} [options]
+
+Where options include:
+EOS
+  opt :dir, "Base directory for all index files", :short => "d", :default => "#{XDG["DATA"]}/heliotrope"
+  opt :reorder, "Reorder all documents based on date header"
+  opt :index_deleted, "Index deleted messages rather than skipping them"
+  opt :index_spam, "Index spam messages rather than skipping them", :short => "s"
+  opt :num, "Only process this many messages", :type => :int, :short => "n"
+  opt :verbose, "Enable verbose output"
+end
+Trollop::die "invalid argument: #{ARGV.first}" unless ARGV.empty?
+
+class Loader
+  def initialize metaindex, zmbox, opts={}
+    @metaindex = metaindex
+    @zmbox = zmbox
+    @load_spam = opts[:load_spam]
+    @load_deleted = opts[:load_deleted]
+    @sort = opts[:sort]
+    @num_deleted = @num_spam = 0
+  end
+
+  attr_reader :num_deleted, :num_spam
+
+  def each_message(&b)
+    if @sort
+      each_message_sorted(&b)
+    else
+      each_message_regular(&b)
+    end
+  end
+
+private
+
+  def each_message_regular
+    doc_id = 0
+    num_deleted = num_spam = 0
+    startt = lastt = Time.now
+    puts "Reindexing..."
+    while true
+      doc_id += 1
+      entry, labels = get_message_summary_for doc_id
+      break unless entry
+      yield doc_id, entry, labels
+    end
+  end
+
+  def each_message_sorted
+    ids_and_dates = []
+    doc_id = 0
+    puts "Loading dates..."
+    while true
+      doc_id += 1
+      metainfo = @metaindex.load_messageinfo doc_id
+      break unless metainfo
+      ids_and_dates << [doc_id, metainfo[:date]]
+    end
+    puts "Sorting..."
+    ids_and_dates = ids_and_dates.sort_by { |id, date| date }
+    puts "Reindexing..."
+    ids_and_dates.each do |id, date|
+      entry, labels = get_message_summary_for id
+      yield id, entry, labels
+    end
+  end
+
+  def get_message_summary_for doc_id
+    metainfo = @metaindex.load_messageinfo doc_id
+    return unless metainfo
+
+    entry, labels = if metainfo[:state].member?("deleted") && !@load_deleted
+      @num_deleted += 1
+      [Whistlepig::Entry.new, []]
+    elsif metainfo[:state].member?("spam") && !@load_spam
+      @num_spam += 1
+      [Whistlepig::Entry.new, []]
+    else
+      rawbody = @zmbox.read metainfo[:loc]
+      rawbody.force_encoding "binary" if rawbody.respond_to?(:force_encoding) # sigh...
+      message = Heliotrope::Message.new(rawbody).parse!
+      entry = Whistlepig::Entry.new
+      entry.add_string "from", @metaindex.indexable_text_for(message.from).downcase
+      entry.add_string "to", message.recipients.map { |x| @metaindex.indexable_text_for x }.join(" ").downcase
+      entry.add_string "subject", message.subject.downcase
+      entry.add_string "date", message.date.to_s
+      entry.add_string "body", @metaindex.indexable_text_for(message).downcase
+      [entry, metainfo[:labels] + metainfo[:state]]
+    end
+  end
+end
+
+FileUtils.mkdir_p File.join(opts.dir, "index-reindexed")
+store = LevelDB::DB.new File.join(opts.dir, "store")
+
+new_index_fn = File.join(opts.dir, "index-reindexed", "whistlepig")
+if Whistlepig::Index.exists? new_index_fn
+  abort "Error: a reindex already exists in #{File.join opts.dir, "index-reindexed"}. Delete that directory first."
+end
+index = Whistlepig::Index.new new_index_fn
+hooks = Heliotrope::Hooks.new File.join(opts.dir, "hooks")
+metaindex = Heliotrope::MetaIndex.load_or_die! store, nil, hooks # nil index! (for "security")
+zmbox = Heliotrope::ZMBox.new File.join(opts.dir, "messages")
+loader = Loader.new metaindex, zmbox, :load_spam => opts.index_spam, :load_deleted => opts.index_deleted, :sort => opts.reorder
+
+startt = lastt = Time.now
+num_docs = 0
+loader.each_message do |store_docid, entry, labels|
+  num_docs += 1
+  index_docid = index.add_entry entry
+  labels.each { |l| index.add_label index_docid, l }
+  metaindex.write_docid_mapping! store_docid, index_docid
+
+  if (Time.now - lastt) > 5
+    elapsed = Time.now - startt
+    num_indexed = num_docs - loader.num_deleted - loader.num_spam
+    printf "; reindexed %d messages, skipped %d spam and %d deleted in %.1fs = %.1f m/s\n", num_indexed, loader.num_spam, loader.num_deleted, elapsed, num_indexed / elapsed
+    lastt = Time.now
+  end
+
+  break if opts.num && num_docs >= opts.num
+end
+
+elapsed = Time.now - startt
+num_indexed = num_docs - loader.num_deleted - loader.num_spam
+printf "; reindexed %d messages, skipped %d spam and %d deleted in %.1fs = %.1f m/s\n", num_indexed, loader.num_spam, loader.num_deleted, elapsed, num_indexed / elapsed
+
+puts <<EOS
+Done!
+To use the new index, replace #{File.join opts.dir, "index"} with #{File.join opts.dir, "index-reindexed"}.
+EOS

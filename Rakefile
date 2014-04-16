@@ -1,5 +1,5 @@
 require 'rubygems'
-require 'rake/gempackagetask.rb'
+require 'rubygems/package_task'
 
 spec = Gem::Specification.new do |s|
  s.name = "heliotrope"
@@ -35,7 +35,7 @@ task :test do
   sh %!ruby -rubygems -Ilib:ext:bin:test test/test_heliotrope.rb!
 end
 
-Rake::GemPackageTask.new(spec) do |pkg|
+Gem::PackageTask.new(spec) do |pkg|
   pkg.need_tar = true
 end
 

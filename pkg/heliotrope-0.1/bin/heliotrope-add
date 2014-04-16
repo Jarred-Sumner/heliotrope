@@ -1,0 +1,105 @@
+#!/usr/bin/env ruby
+# encoding: UTF-8
+
+require 'rubygems'
+require 'trollop'
+require 'curb'
+require 'uri'
+require 'cgi'
+require "heliotrope"
+require 'json'
+
+opts = Trollop::options do
+  banner <<EOS
+Adds an email or a set of emails to a Heliotrope server. By default, takes a
+single message on stdin. Can also submit all the messages in an mbox file, a
+maildir, a GMail account, or an IMAP folder.
+
+For GMail accounts and IMAP folders, will record the last message seen.
+Successive calls will pick up only new messages.
+
+Usage: #{$0} [options]
+
+Where options include:
+EOS
+  opt :host, "Heliotrope server host", :default => "localhost", :short => "H"
+  opt :port, "Heliotrope server port", :default => 8042
+  opt :num_messages, "Index at most this many messages and then quit", :type => Integer, :short => "n"
+  opt :num_skip, "Skip this many many messages and then start adding", :type => Integer, :short => "k"
+  opt :state_file, "Store state to, and read state from, this file. This enables successive runs against the same source to pick up only what's changed.", :type => String
+  opt :add_labels, "Add these labels to every message (should be a comma-separated list)", :type => String
+  opt :remove_labels, "Do not add any of these labels to any message (should be a comma-separated list)", :type => String
+  opt :verbose, "Enable verbose output"
+
+  banner <<EOS
+
+Options for reading from an mbox file:
+EOS
+  opt :mbox_fn, "mbox filename", :type => String, :short => "m"
+  opt :mbox_start_offset, "Start file offset for scanning", :default => 0, :short => "s"
+  banner <<EOS
+
+Options for reading from a maildir directory:
+EOS
+  opt :maildir_dirs, "maildir directory", :type => :strings
+  banner <<EOS
+
+Options for reading from an IMAP account:
+EOS
+  opt :imap_host, "IMAP server hostname", :type => String
+  opt :imap_port, "IMAP server port (default: 993 with ssl, 143 without)", :type => Integer
+  opt :dont_use_ssl, "Don't use SSL"
+  opt :imap_username, "IMAP username (default: prompt)", :type => String
+  opt :imap_password, "IMAP password (default: prompt)", :type => String
+  opt :imap_folder, "IMAP folder", :default => "INBOX"
+
+  banner <<EOS
+
+Options for reading from a GMail account:
+EOS
+  opt :gmail_username, "GMail username (default: prompt)", :type => String
+  opt :gmail_password, "GMail password (default: prompt)", :type => String
+
+  banner <<EOS
+
+If none of the mbox, maildir, IMAP or GMail options are given, will read a
+single message from stdin.
+EOS
+
+  conflicts :mbox_fn, :maildir_dirs, :imap_host, :gmail_username
+end
+
+Trollop::die "unknown argument: #{ARGV.first}" unless ARGV.empty?
+
+add_labels = (opts.add_labels || "").split(/\s*,\s*/)
+remove_labels = (opts.remove_labels || "").split(/\s*,\s*/)
+
+adder = Heliotrope::MessageAdder.new opts
+server_url = "http://#{opts.host}:#{opts.port}/message.json"
+adder.each_message do |rawbody, state, labels|
+  seen = indexed = bad = false
+  labels += add_labels
+  labels -= remove_labels
+
+  params = { :message => rawbody, :state => state.to_json, :labels => labels.to_json }
+  response = Curl::Easy.http_post server_url, params.map { |k, v| "#{k}=#{CGI.escape v}" }.join("&")
+  if response.response_code != 200
+    Trollop::die "Unexpected HTTP response code #{response.response_code} posting to #{server_url}"
+  end
+  response = response.body_str
+  response = JSON.parse response
+
+  if response["response"] == "ok"
+    if response["status"] == "seen"
+      seen = true
+    else
+      indexed = true
+    end
+  else
+    bad = true
+    ## everybody has broken messages, nobody things they do. don't cause panic.
+    ## puts "Error for message at offset #{offset}: " + response["error_message"]
+  end
+
+  [seen, indexed, bad]
+end

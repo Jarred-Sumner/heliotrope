@@ -1,0 +1,79 @@
+#!/usr/bin/env ruby
+
+$:.unshift File.join(File.expand_path(File.dirname(__FILE__)), "..", "lib")
+
+require 'rubygems'
+require 'trollop'
+require 'whistlepig'
+require 'irb'
+require 'xdg'
+
+require "heliotrope"
+
+module IRB
+  def IRB.start_with_binding binding
+    IRB.setup __FILE__
+    w = WorkSpace.new binding
+    irb = Irb.new w
+    @CONF[:MAIN_CONTEXT] = irb.context
+    irb.eval_input
+  end
+end
+
+opts = Trollop::options do
+  banner <<EOS
+Usage: #{$0} [options]
+
+Where options include:
+EOS
+  opt :dir, "Base directory for all index files", :type => String, :default => "#{XDG["DATA"]}/heliotrope"
+end
+
+include Heliotrope
+store = LevelDB::DB.new File.join(opts.dir, "store")
+index = Whistlepig::Index.new File.join(opts.dir, "index", "whistlepig")
+hooks = Hooks.new File.join(opts.dir, "hooks")
+metaindex = MetaIndex.load_or_die! store, index, hooks
+zmbox = ZMBox.new File.join(opts.dir, "messages")
+
+puts <<EOS
+Heliotrope console started.
+
+'index'     is the whistlepig index
+'metaindex' is the metaindex
+'store'     is the levelDB store
+'zmbox'     is the message store
+
+Search:
+  q = Query.new "body", "hello"
+  metaindex.set_query q
+  results = metaindex.get_some_results 5
+
+The results are an array of threadinfo hashes.
+Look at a single threadinfo:
+  t = results.first
+  t[:subject]
+  t[:date]
+
+Get the messageinfos for a thread:
+  mi = metaindex.load_thread_messageinfos t[:thread_id]
+
+The messageinfos are nested to represent the thread structure.
+Look at a single messageinfo:
+  m = mi.flatten.first
+  m[:from]
+  m[:date]
+
+To load the actual content of a message, we go to the message store.
+  body = zmbox.read m[:loc]
+
+Have fun and be safe!
+
+MetaIndex contains #{metaindex.size} messages.
+EOS
+
+begin
+  IRB.start_with_binding binding
+rescue Interrupt
+  puts "bye!"
+end
